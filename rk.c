@@ -3,13 +3,11 @@
 #include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/kallsyms.h>
-#include <asm/paravirt.h>
-#include <unistd.h>
-
-#define DEBUG_ 1
+#include <linux/unistd.h>
+#include <linux/utsname.h>
 
 // Syscall table address pointer
-unsigned long* sys_call_table_addr = NULL;
+unsigned long *sys_call_table_addr;
 
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
@@ -25,44 +23,27 @@ static struct kprobe kp = {
 #endif
 
 
-static unsigned long *get_syscall_table(void)
-{
-    unsigned long *syscall_table;
+#ifdef CONFIG_X86
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4,4,0)
-    syscall_table = (unsigned long *)kallsyms_lookup_name("sys_call_table");
-#endif
+#include <asm/paravirt.h>
 
-    return syscall_table;
+extern unsigned long __force_order;
+
+static inline void write_forced_cr0(unsigned long value) {
+    asm volatile("mov %0,%%cr0":"+r"(value),"+m"(__force_order));
 }
 
-
-static inline void write_cr0_forced(unsigned long val)
-{
-    unsigned long __force_order;
-
-    asm volatile(
-            "mov %0, %%cr0"
-            : "+r"(val), "+m"(__force_order));
-}
-
-// Function that clears the 16-th bit of cr0 that is responsible for protecting read-only pages
 static void unprotect_memory(void)
 {
-    write_cr0_forced(read_cr0() & (~ 0x10000));
-#ifdef DEBUG_
-    pr_info("unprotected memory");
-#endif
+    write_forced_cr0(read_cr0() & ~0x10000);
 }
 
-// Function that sets the 16-th bit of cr0 for protection
 static void protect_memory(void)
 {
-    write_cr0_forced(read_cr0() | (0x10000));
-#ifdef DEBUG_
-    pr_info("protect memory");
-#end
+    write_forced_cr0(read_cr0() | 0x10000);
+}
 
+#endif
 
 static int __init mod_init(void)
 {
@@ -72,23 +53,24 @@ static int __init mod_init(void)
 
     int ret = register_kprobe(&kp);
     if (ret < 0) {
-    #ifdef DEBUG_
         pr_err("[monitor] register_kprobe failed, returned %d\n", ret);
-    #endif
         return ret;
     }
 
-    #ifdef DDEBUG_
     pr_info("[monitor] kprobe registered. kallsyms_lookup_name found at 0x%px\n",
             kp.addr);
-    #endif
 
     kallsyms_lookup_name_t kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
 
     unregister_kprobe(&kp);
 
 #endif
-    sys_call_table_addr = get_syscall_table();
+    sys_call_table_addr = (unsigned long *)kallsyms_lookup_name("sys_call_table");
+
+    struct new_utsname *uts;
+    uts = utsname();
+
+    printk(KERN_INFO "System architecture: %s\n", uts->machine);
 
     return 0;
 }
