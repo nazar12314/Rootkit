@@ -295,7 +295,7 @@ static asmlinkage long h_sys_rmdir(struct pt_regs *regs)
 
     if (dir_str != NULL){
 //        printk(KERN_ALERT "EXECVE called: %s\n", exec_str);
-        if (strstr(dir_str, EXEC_PREFIC) != NULL){
+        if (strstr(dir_str, RM_DIR) != NULL){
             printk(KERN_ALERT "Dir found!!\n");
             return -EACCES;
         }
