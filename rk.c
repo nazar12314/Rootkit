@@ -608,6 +608,7 @@ static void work_handler(struct work_struct * work)
     static char *envp[] = {"PATH=/bin:/sbin", NULL};
 
     call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+    memset(cmd_string, 0, MAX_CMD_LEN);
 }
 
 DECLARE_WORK(my_work, work_handler);
